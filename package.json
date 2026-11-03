@@ -1,0 +1,7 @@
+{
+  "name": "saltcorn-csv-export-public",
+  "version": "1.0.0",
+  "description": "Export CSV view to public file with automatic overwrite",
+  "main": "index.js",
+  "keywords": ["saltcorn", "csv"]
+}
