@@ -23,27 +23,19 @@ module.exports = {
     export_csv_to_file_public: {
       description: "Export CSV to file (Overwrite & Configurable Role)",
       configFields: async () => {
-        // 1. Fetch available CSV Export views
+        // 1. Fetch CSV Export views and use .select_option (returns plain strings like "Trails_CSV [CSV Export]")
         const views = await View.find({ viewtemplate: "CSV Export" });
+        const viewOptions = views.map((v) => v.select_option);
 
-        // 2. Fetch roles configured in your Saltcorn instance
-        let roleOptions = [
-          { label: "Public", value: 100 },
-          { label: "User", value: 80 },
-          { label: "Staff", value: 40 },
-          { label: "Admin", value: 1 },
-        ];
-
+        // 2. Fetch roles as plain strings
+        let roleOptions = ["public", "user", "staff", "admin"];
         try {
           const dbRoles = await User.get_roles();
           if (dbRoles && dbRoles.length > 0) {
-            roleOptions = dbRoles.map((r) => ({
-              label: r.role.charAt(0).toUpperCase() + r.role.slice(1),
-              value: r.id,
-            }));
+            roleOptions = dbRoles.map((r) => r.role);
           }
         } catch (e) {
-          // Fall back to standard defaults if roles table isn't reachable
+          // Fall back to default role names if DB isn't reached
         }
 
         return [
@@ -54,10 +46,7 @@ module.exports = {
             required: true,
             sublabel: "Choose a CSV Export view which will define the columns in the exported CSV file",
             attributes: {
-              options: views.map((v) => ({
-                label: `${v.name} [CSV Export]`,
-                value: v.name,
-              })),
+              options: viewOptions,
             },
           },
           {
@@ -73,13 +62,12 @@ module.exports = {
             required: true,
           },
           {
-            name: "min_role_read",
+            name: "role_name",
             label: "Role access",
-            input_type: "select",
+            type: "String",
             required: true,
-            default: 100,
+            default: "public",
             sublabel: "Minimum role required to access and download this file",
-            options: roleOptions,
             attributes: {
               options: roleOptions,
             },
@@ -87,26 +75,38 @@ module.exports = {
         ];
       },
       run: async ({ configuration, user }) => {
-        const { view_name, where, file_name } = configuration;
+        const { view_name, where, file_name, role_name } = configuration;
 
-        // Parse target role (defaults to 100 / Public if not set)
-        const targetRole =
-          configuration.min_role_read !== undefined && configuration.min_role_read !== null
-            ? parseInt(configuration.min_role_read, 10)
-            : 100;
+        // 1. Resolve numeric role ID from role name
+        const roleMap = { admin: 1, staff: 40, user: 80, public: 100 };
+        let targetRoleId = roleMap[(role_name || "public").toLowerCase()] || 100;
 
-        // 1. Resolve View and Table
-        const view = await View.findOne({ name: view_name });
+        try {
+          const dbRoles = await User.get_roles();
+          const match = dbRoles.find(
+            (r) => r.role.toLowerCase() === (role_name || "").toLowerCase()
+          );
+          if (match) targetRoleId = match.id;
+        } catch (e) {
+          // fallback to roleMap
+        }
+
+        // 2. Resolve View (strip " [CSV Export]" suffix if present)
+        const cleanName = (view_name || "").replace(/\s*\[.*?\]$/, "").trim();
+        let view = await View.findOne({ name: cleanName });
+        if (!view) {
+          view = await View.findOne({ name: view_name });
+        }
         if (!view) throw new Error(`Export view "${view_name}" not found.`);
 
         const table = Table.findOne({ id: view.table_id });
         if (!table) throw new Error(`Underlying table for view "${view_name}" not found.`);
 
-        // 2. Query rows
+        // 3. Query rows
         const columns = view.configuration?.columns || [];
         let rows = await table.getJoinedRows({});
 
-        // 3. Apply Where filter if set
+        // 4. Filter by Where expression if supplied
         if (where && where.trim()) {
           rows = rows.filter((row) => {
             try {
@@ -117,7 +117,7 @@ module.exports = {
           });
         }
 
-        // 4. Construct CSV text
+        // 5. Construct CSV output
         const headers = columns.map((col) => col.header || col.field_name || "");
         const csvLines = [headers.map(toCsvValue).join(",")];
 
@@ -138,28 +138,27 @@ module.exports = {
 
         const targetFilename = file_name.endsWith(".csv") ? file_name : `${file_name}.csv`;
 
-        // 5. Overwrite: Delete previous file if already present
+        // 6. Delete previous file to prevent duplicate names (_1.csv)
         const existing = await File.findOne({ filename: targetFilename });
         if (existing) {
           await existing.delete();
         }
 
-        // 6. Save file with the chosen role
+        // 7. Save file with the selected role
         const file = await File.from_contents(
           targetFilename,
           "text/csv",
           csvContent,
           user ? user.id : null,
-          targetRole
+          targetRoleId
         );
 
-        // Ensure permission is forced in DB record
         if (file && file.id) {
-          await File.update(file.id, { min_role_read: targetRole });
+          await File.update(file.id, { min_role_read: targetRoleId });
         }
 
         return {
-          notify: `Exported ${rows.length} rows to ${targetFilename} with role permission: ${targetRole}.`,
+          notify: `Exported ${rows.length} rows to ${targetFilename} (${role_name || "public"}).`,
         };
       },
     },
